@@ -7,7 +7,9 @@ import matplotlib.colors as colors
 import numpy as np
 import pandas as pd
 import regions
-from astropy.coordinates import SkyCoord
+import logging
+import warnings
+from astropy.coordinates import SkyCoord, FK5
 from astropy.io import fits
 from astropy.nddata import Cutout2D
 from astropy.table import Table
@@ -15,7 +17,13 @@ from astropy.units import Quantity
 from astropy.wcs import WCS
 from spectral_cube import SpectralCube, StokesSpectralCube
 from pathlib import Path
+from tqdm import tqdm
+from astropy.io.fits.verify import VerifyWarning
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.hasHandlers():
+    logger.addHandler(logging.StreamHandler())
 
 class CataData:
     """A class taking fits catalogues and images and producing
@@ -56,7 +64,7 @@ class CataData:
             cutout_shape (Union[int, Sequence[int], Sequence[str]], optional):
                 Shape of the cutout. Defaults to (32, 32). If strings are provided, these are used as keys to the catalogue to extract the shape for each entry.
             memmap (bool, optional):
-                Whether to use memory mapping (dynamic reading of images into memory). Defaults to False.
+                Whether to use memory mapping (dynamic reading of images into memory). Defaults to True.
             targets (bool, optional):
                 Column names of the targets in the catalogue. If it is a string, it is converted to a list of length 1. Defaults to None.
             transform (Optional[Callable], optional):
@@ -366,18 +374,91 @@ class CataData:
         )
         plt.show()
 
+    def _match_coords_to_fields(self, df) -> dict:
+        coords = SkyCoord(
+            ra=df["ra"].values * units.deg,
+            dec=df["dec"].values * units.deg,
+            frame=FK5,
+            equinox="J2000"
+        )
+        # First pass - record all candidate FITS images and distance to image centre for each source
+        candidate_image_map = {source_id: [] for source_id in df["id"]}
+        image_centres = {}
+        field_iter = tqdm(self.field_names, total=len(self.field_names), desc="Locating sources in each field")
+        for field_name in field_iter:
+            wcs = self.wcs[field_name]
+            ny, nx = wcs.array_shape
+            # Convert all source coordinates to pixel coordinates
+            x_pix, y_pix = wcs.world_to_pixel(coords)
+            # Find centre pixel of the image
+            cx = (nx - 1) / 2.0
+            cy = (ny - 1) / 2.0
+            image_centres[field_name] = (cx, cy)
+            # Find the indices of sources that are inside this image
+            in_file_mask = ((x_pix >= 0) & (x_pix <= nx - 1) & (y_pix >= 0) & (y_pix <= ny - 1))
+            in_file_indices = np.nonzero(in_file_mask)[0]
+            # Compute squared distance between source and image centre for ranking
+            dx = x_pix[in_file_indices] - cx
+            dy = y_pix[in_file_indices] - cy
+            square_distance = dx**2 + dy**2
+            for idx, d2 in zip(in_file_indices, square_distance):
+                candidate_image_map[df["id"].iloc[idx]].append((field_name, float(d2)))
+        # Second pass - choose best image for each source based on minimum square distance to the centre
+        source_field_map = {}
+        source_iter = tqdm(df["id"].values, total=len(df), desc="Selecting best field for each source")
+        for source_id in source_iter:
+            candidates = candidate_image_map[source_id]
+            if not candidates:
+                source_field_map[source_id] = None
+                continue
+            # Select image with minimum square distance to centre and record its field name
+            field_name = min(candidates, key=lambda t: t[1])[0]
+            source_field_map[source_id] = field_name
+        # Check that all sources were assigned to an image - if not, raise a warning
+        missing_sources = [source_id for source_id, files in source_field_map.items() if source_field_map[source_id] is None]
+        if missing_sources:
+            logger.warning(f"Some sources were not assigned to any field.")
+            for source in missing_sources:
+                logger.info(f"Missing source {source}")
+        return source_field_map
+
+    def _parse_catalogue(self, catalogue_path) -> pd.DataFrame:
+        df = self.open_catalogue(path=catalogue_path)
+        if df.shape[0] == 0:
+            raise ValueError(f"No rows found in catalogue {catalogue_path}.")
+        cols = {c.lower(): c for c in df.columns} # Case-insensitive
+        # Check ID column exists
+        if "id" not in cols:
+            raise ValueError(f"Missing ID column in catalogue {catalogue_path}.")
+        # Check RA and Dec columns exist
+        if "ra" not in cols or "dec" not in cols:
+            raise ValueError(f"Missing coordinates in catalogue {catalogue_path}.")
+        # Check field column exists - if it doesn't, create it (currently only works with celestial axes)
+        if "field" not in cols:
+            if not self.spectral_axis and not self.stokes_axis:
+                logger.info(f"Matching source coordinates to fields for catalogue {catalogue_path} ...")
+                source_field_map = self._match_coords_to_fields(df)
+                logger.info(f"Finished matching source coordinates to fields for catalogue {catalogue_path}.")
+                df["field"] = df["id"].map(source_field_map)
+            else:
+                raise ValueError(f"Missing fields in catalogue {catalogue_path}.")
+        n_duplicates = df["id"].duplicated().sum()
+        if n_duplicates > 0:
+            logger.warning(f"{n_duplicates} duplicate ID(s) found in catalogue {catalogue_path}; keeping only the first instance of each source.")
+        df = df.drop_duplicates(subset="id", keep="first")
+        return df
+
     def _build_df(self) -> pd.DataFrame:
         """Generates a single dataframe for all input data.
         Data is separated by provided field names for easier sampling.
         catalogue_preprocessing is called on the data here.
 
         Returns:
-            pd.DataFrame: Single processed data frame constructed through the provided catalogue paths and field names (i.e. catalogue / imgae pair names).
+            pd.DataFrame: Single processed data frame constructed through the provided catalogue paths and field names (i.e. catalogue / image pair names).
         """
         df = []
-        for catalogue_path, field in zip(self.catalogue_paths, self.field_names):
-            tmp = self.open_catalogue(path=catalogue_path)
-            tmp["field"] = field
+        for catalogue_path in self.catalogue_paths:
+            tmp = self._parse_catalogue(catalogue_path)
             df.append(tmp)
         df = pd.concat(df, ignore_index=True)
         if self.catalogue_preprocessing is not None:
@@ -393,7 +474,7 @@ class CataData:
             drop_axes (List[int]): Not implemented.
 
         Returns:
-            Tuple[Dict[Union[str, int], Any], Dict[Union[str, int], Any]]: Dict of arrays and a dict of coordinates (wcs). One entry each for the respective provided field names.
+            Tuple[Dict[Union[str, int], Any], Dict[Union[str, int], Asny]]: Dict of arrays and a dict of coordinates (wcs). One entry each for the respective provided field names.
         """
         if self.spectral_axis:
             cubes, wcs = {}, {}
@@ -409,17 +490,19 @@ class CataData:
             return cubes, wcs
         else:
             images, wcs = {}, {}
-            for image_path, field in zip(self.image_paths, self.field_names):
-                data, wcs_ = self.open_fits(
-                    path=image_path,
-                    index=self.fits_index_images,
-                )
-
-                images[field] = data
-                wcs[field] = wcs_
-            for field in self.field_names:
-                if self.wcs_preprocessing is not None:
-                    wcs[field] = self.wcs_preprocessing(wcs[field], field)
+            image_iter = tqdm(zip(self.image_paths, self.field_names), total=len(self.image_paths), desc="Getting image data")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=VerifyWarning)
+                for image_path, field in image_iter:
+                    data, wcs_ = self.open_fits(
+                        path=image_path,
+                        index=self.fits_index_images,
+                    )
+                    images[field] = data
+                    wcs[field] = wcs_
+                for field in self.field_names:
+                    if self.wcs_preprocessing is not None:
+                        wcs[field] = self.wcs_preprocessing(wcs[field], field)
             return images, wcs
 
     def _synthesise_df(self, overlap: float, **kwargs):
@@ -487,7 +570,7 @@ class CataData:
         """
         with fits.open(path, memmap=self.memmap) as hdul:
             data = hdul[index].data
-            wcs = WCS(hdul[index].header, naxis=2)
+            wcs = WCS(hdul[index].header).celestial
         return data, wcs
 
     def open_catalogue(
@@ -509,8 +592,10 @@ class CataData:
                 table = Table.read(path, memmap=True, format="fits")
             elif _path.suffix == ".txt":
                 table = Table.read(path, format="ascii.commented_header")
+            elif _path.suffix == ".csv":
+                table = Table.read(path, format="ascii.csv")
             else:
-                raise ValueError("Catalogue format not recognised")
+                raise ValueError("Catalogue format not recognised.")
         else:
             raise ValueError("The path parameter is not a file.")
 
@@ -550,18 +635,9 @@ class CataData:
             )
 
     def _verify_input_lengths(self) -> None:
-        """Check that catalogues, images, fits_index_catalogues, fits_index_images,
-        fields all have correct lengths in relation to one another."""
-        if self.catalogue_paths is None:
-            if len(self.image_paths) != len(self.field_names):
-                raise ValueError(
-                    f"""Paths and fields must have same number of entries. Currently there are {len(self.image_paths)} image_paths, {len(self.field_names)} field_names. No catalogues provided."""
-                )
-            return
-        if not (
-            len(self.image_paths) == len(self.catalogue_paths) == len(self.field_names)
-        ):
+        """Check that images and fields have correct lengths in relation to one another."""
+        if len(self.image_paths) != len(self.field_names):
             raise ValueError(
-                f"""Paths and fields must have same number of entries. Currently there are {len(self.image_paths)} image_paths, {len(self.catalogue_paths)} catalogue_paths, {len(self.field_names)} field_names"""
+                f"""Paths and fields must have same number of entries. Currently there are {len(self.image_paths)} image_paths, {len(self.field_names)} field_names. No catalogues provided."""
             )
         return
