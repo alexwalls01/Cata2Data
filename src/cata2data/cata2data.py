@@ -126,12 +126,16 @@ class CataData:
         self.return_wcs = return_wcs
 
         self.fill_value = fill_value
-        self.images, self.wcs = self._build_images(image_drop_axes)
+
+        self.wcs = self._get_wcs(self.fits_index_images)
         self.df = (
             self._build_df()
             if catalogue_paths is not None
             else self._synthesise_df(overlap=overlap)
         )
+        self._filter_unused_images()
+        self._build_images()
+
 
     def __getitem__(self, index: int, force_return_wcs: bool = False) -> np.ndarray:
         """Gets the respective indexed item within the data set. Indexes from the built catalogue data frame.
@@ -464,6 +468,21 @@ class CataData:
         if self.catalogue_preprocessing is not None:
             df = self.catalogue_preprocessing(df)
         return df
+    
+    def _filter_unused_images(self):
+        used_fields = set(self.df["field"].unique())
+        filtered_image_paths = []
+        filtered_field_names = []
+        filtered_wcs = {}
+        for path, field in zip(self.image_paths, self.field_names):
+            if field in used_fields:
+                filtered_image_paths.append(path)
+                filtered_field_names.append(field)
+                filtered_wcs[field] = self.wcs[field]
+        self.image_paths = filtered_image_paths
+        self.field_names = filtered_field_names
+        self.wcs = filtered_wcs
+        logger.info(f"Filtered out {len(self.field_names) - len(filtered_field_names)} unused images.")
 
     def _build_images(
         self, drop_axes: List[int]
@@ -486,7 +505,6 @@ class CataData:
                 # https://spectral-cube.readthedocs.io/en/latest/accessing.html#data-values
                 cubes[field] = cube
                 wcs[field] = cube.wcs
-
             return cubes, wcs
         else:
             images, wcs = {}, {}
@@ -556,6 +574,13 @@ class CataData:
             df["dec"] += list(dec)
         df = pd.DataFrame(df).dropna()
         return df
+    
+    def _get_wcs(self, index: int):
+        wcs = {}
+        for path, field in zip(self.image_paths, self.field_names):
+            with fits.open(path) as hdul:
+                wcs[field] = WCS(hdul[index].header).celestial
+        return wcs
 
     def open_fits(self, path: str, index: int, drop_axes: List[int] = None) -> tuple:
         """Opens fits data.
