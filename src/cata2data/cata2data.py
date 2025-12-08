@@ -577,9 +577,10 @@ class CataData:
     
     def _get_wcs(self, index: int):
         wcs = {}
+        wcs_iter = tqdm(zip(self.image_paths, self.field_names), total=len(self.image_paths), desc="Getting WCS data")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=VerifyWarning)
-            for path, field in zip(self.image_paths, self.field_names):
+            for path, field in wcs_iter:
                 with fits.open(path) as hdul:
                     wcs[field] = WCS(hdul[index].header).celestial
         return wcs
