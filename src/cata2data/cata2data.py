@@ -577,9 +577,11 @@ class CataData:
     
     def _get_wcs(self, index: int):
         wcs = {}
-        for path, field in zip(self.image_paths, self.field_names):
-            with fits.open(path) as hdul:
-                wcs[field] = WCS(hdul[index].header).celestial
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=VerifyWarning)
+            for path, field in zip(self.image_paths, self.field_names):
+                with fits.open(path) as hdul:
+                    wcs[field] = WCS(hdul[index].header).celestial
         return wcs
 
     def open_fits(self, path: str, index: int, drop_axes: List[int] = None) -> tuple:
