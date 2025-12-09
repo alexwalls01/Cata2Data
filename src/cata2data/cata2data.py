@@ -134,7 +134,7 @@ class CataData:
             else self._synthesise_df(overlap=overlap)
         )
         self._filter_unused_images()
-        self._build_images()
+        self.images = self._build_images(image_drop_axes)
 
 
     def __getitem__(self, index: int, force_return_wcs: bool = False) -> np.ndarray:
@@ -479,24 +479,24 @@ class CataData:
                 filtered_image_paths.append(path)
                 filtered_field_names.append(field)
                 filtered_wcs[field] = self.wcs[field]
+        logger.info(f"Filtered out {len(self.field_names) - len(filtered_field_names)} unused images.")
         self.image_paths = filtered_image_paths
         self.field_names = filtered_field_names
         self.wcs = filtered_wcs
-        logger.info(f"Filtered out {len(self.field_names) - len(filtered_field_names)} unused images.")
 
     def _build_images(
         self, drop_axes: List[int]
     ) -> Tuple[Dict[Union[str, int], Any], Dict[Union[str, int], Any]]:
-        """Reads in the fields. Returns a dict of arrays and a dict of wcs coordinates.
+        """Reads in the fields. Returns a dict of arrays.
 
         Args:
             drop_axes (List[int]): Not implemented.
 
         Returns:
-            Tuple[Dict[Union[str, int], Any], Dict[Union[str, int], Asny]]: Dict of arrays and a dict of coordinates (wcs). One entry each for the respective provided field names.
+            Dict[Union[str, int], Any]: Dict of arrays. One entry each for the respective provided field names.
         """
         if self.spectral_axis:
-            cubes, wcs = {}, {}
+            cubes = {}
             for image_path, field in zip(self.image_paths, self.field_names):
                 if self.stokes_axis:
                     cube = StokesSpectralCube.read(image_path)
@@ -504,24 +504,19 @@ class CataData:
                     cube = SpectralCube.read(image_path)
                 # https://spectral-cube.readthedocs.io/en/latest/accessing.html#data-values
                 cubes[field] = cube
-                wcs[field] = cube.wcs
-            return cubes, wcs
+            return cubes
         else:
-            images, wcs = {}, {}
+            images = {}
             image_iter = tqdm(zip(self.image_paths, self.field_names), total=len(self.image_paths), desc="Getting image data")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=VerifyWarning)
                 for image_path, field in image_iter:
-                    data, wcs_ = self.open_fits(
+                    data, _ = self.open_fits(
                         path=image_path,
                         index=self.fits_index_images,
                     )
                     images[field] = data
-                    wcs[field] = wcs_
-                for field in self.field_names:
-                    if self.wcs_preprocessing is not None:
-                        wcs[field] = self.wcs_preprocessing(wcs[field], field)
-            return images, wcs
+            return images
 
     def _synthesise_df(self, overlap: float, **kwargs):
         """Generate a df that samples the images as patches across the frame.
@@ -578,11 +573,22 @@ class CataData:
     def _get_wcs(self, index: int):
         wcs = {}
         wcs_iter = tqdm(zip(self.image_paths, self.field_names), total=len(self.image_paths), desc="Getting WCS data")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=VerifyWarning)
+        if self.spectral_axis:
             for path, field in wcs_iter:
-                with fits.open(path) as hdul:
-                    wcs[field] = WCS(hdul[index].header).celestial
+                if self.stokes_axis:
+                    cube = StokesSpectralCube.read(path)
+                else:
+                    cube = SpectralCube.read(path)
+                # https://spectral-cube.readthedocs.io/en/latest/accessing.html#data-values
+                wcs[field] = cube.wcs
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=VerifyWarning)
+                for path, field in wcs_iter:
+                    with fits.open(path) as hdul:
+                        wcs[field] = WCS(hdul[index].header).celestial
+        if self.wcs_preprocessing is not None:
+            wcs[field] = self.wcs_preprocessing(wcs[field], field)
         return wcs
 
     def open_fits(self, path: str, index: int, drop_axes: List[int] = None) -> tuple:
